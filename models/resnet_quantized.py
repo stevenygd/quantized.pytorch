@@ -259,3 +259,9 @@ def resnet_quantized(**kwargs):
         depth = depth or 56
         return ResNet_cifar10(num_classes=num_classes,
                               block=BasicBlock, depth=depth)
+
+    elif dataset == 'cifar100':
+        num_classes = num_classes or 100
+        depth = depth or 56
+        return ResNet_cifar10(num_classes=num_classes,
+                              block=BasicBlock, depth=depth)

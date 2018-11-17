@@ -17,6 +17,7 @@ from utils.optim import OptimRegime
 from utils.misc import torch_dtypes
 from datetime import datetime
 from ast import literal_eval
+from tensorboardX import SummaryWriter
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -49,7 +50,7 @@ parser.add_argument('--device_ids', default=[0], type=int, nargs='+',
                     help='device ids assignment (e.g 0 1 2 3')
 parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 8)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=300, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -63,7 +64,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
-parser.add_argument('--print-freq', '-p', default=10, type=int,
+parser.add_argument('--print-freq', '-p', default=50, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -71,10 +72,13 @@ parser.add_argument('-e', '--evaluate', type=str, metavar='FILE',
                     help='evaluate model FILE on validation set')
 parser.add_argument('--seed', default=123, type=int,
                     help='random seed (default: 123)')
-
+parser.add_argument('--log_dir', default=None, type=str,
+                    help='Log directory.')
 
 def main():
     global args, best_prec1, dtype
+
+
     best_prec1 = 0
     args = parser.parse_args()
     dtype = torch_dtypes.get(args.dtype)
@@ -84,6 +88,13 @@ def main():
         args.results_dir = '/tmp'
     if args.save is '':
         args.save = time_stamp
+
+    if args.log_dir is None:
+        import time
+        writer = SummaryWriter(log_dir="runs/time-%d"%int(time.time()))
+    else:
+        writer = SummaryWriter(log_dir="runs/%s"%(args.log_dir))
+
     save_path = os.path.join(args.results_dir, args.save)
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -113,6 +124,7 @@ def main():
         model_config = dict(model_config, **literal_eval(args.model_config))
 
     model = model(**model_config)
+
     logging.info("created model with configuration: %s", model_config)
 
     # optionally resume from a checkpoint
@@ -151,11 +163,14 @@ def main():
                               input_size=args.input_size, augment=False)
     }
     transform = getattr(model, 'input_transform', default_transform)
-    regime = getattr(model, 'regime', [{'epoch': 0,
-                                        'optimizer': args.optimizer,
-                                        'lr': args.lr,
-                                        'momentum': args.momentum,
-                                        'weight_decay': args.weight_decay}])
+    regime = getattr(model, 'regime', [
+        {'epoch': 0, 'optimizer': args.optimizer, 'lr': args.lr,
+         'momentum': args.momentum, 'weight_decay': args.weight_decay},
+        {'epoch': 100, 'optimizer': args.optimizer, 'lr': args.lr * 0.1,
+         'momentum': args.momentum, 'weight_decay': args.weight_decay},
+        {'epoch': 200, 'optimizer': args.optimizer, 'lr': args.lr * 0.01,
+         'momentum': args.momentum, 'weight_decay': args.weight_decay},
+    ])
 
     # define loss function (criterion) and optimizer
     criterion = getattr(model, 'criterion', nn.CrossEntropyLoss)()
@@ -184,11 +199,11 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
         train_loss, train_prec1, train_prec5 = train(
-            train_loader, model, criterion, epoch, optimizer)
+            train_loader, model, criterion, epoch, optimizer, writer)
 
         # evaluate on validation set
         val_loss, val_prec1, val_prec5 = validate(
-            val_loader, model, criterion, epoch)
+            val_loader, model, criterion, epoch, writer)
 
         # remember best prec@1 and save checkpoint
         is_best = val_prec1 > best_prec1
@@ -227,11 +242,11 @@ def main():
         results.save()
 
 
-def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=None):
+def forward(data_loader, model, criterion, writer, epoch=0, training=True, optimizer=None):
     regularizer = getattr(model, 'regularization', None)
     if args.device_ids and len(args.device_ids) > 1:
         model = torch.nn.DataParallel(model, args.device_ids)
-        
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -271,6 +286,12 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if training:
+            step = epoch * len(data_loader) + i
+            writer.add_scalar("train/loss", losses.val, step)
+            writer.add_scalar("train/prec_1", top1.val, step)
+            writer.add_scalar("train/prec_5", top5.val, step)
+
         if i % args.print_freq == 0:
             logging.info('{phase} - Epoch: [{0}][{1}/{2}]\t'
                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -283,21 +304,26 @@ def forward(data_loader, model, criterion, epoch=0, training=True, optimizer=Non
                              batch_time=batch_time,
                              data_time=data_time, loss=losses, top1=top1, top5=top5))
 
+    if not training:
+        step = epoch
+        writer.add_scalar("val/loss", losses.avg, step)
+        writer.add_scalar("val/prec_1", top1.avg, step)
+        writer.add_scalar("val/prec_5", top5.avg, step)
     return losses.avg, top1.avg, top5.avg
 
 
-def train(data_loader, model, criterion, epoch, optimizer):
+def train(data_loader, model, criterion, epoch, optimizer, writer):
     # switch to train mode
     model.train()
-    return forward(data_loader, model, criterion, epoch,
+    return forward(data_loader, model, criterion, writer, epoch,
                    training=True, optimizer=optimizer)
 
 
-def validate(data_loader, model, criterion, epoch):
+def validate(data_loader, model, criterion, epoch, writer):
     # switch to evaluate mode
     model.eval()
     with torch.no_grad():
-        return forward(data_loader, model, criterion, epoch,
+        return forward(data_loader, model, criterion, writer, epoch,
                        training=False, optimizer=None)
 
 
